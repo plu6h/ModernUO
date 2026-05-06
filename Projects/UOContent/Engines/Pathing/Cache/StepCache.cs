@@ -65,9 +65,20 @@ public sealed class StepCache
     /// </summary>
     public void Clear()
     {
+        ClearResidentChunks();
+        CloseLazyReaders();
+    }
+
+    /// <summary>
+    /// Drop all resident chunks AND zero counters, but keep lazy readers open.
+    /// Useful in benchmark loops that want to measure "first query after boot" cost
+    /// without paying the lazy-reader reopen overhead each iteration. Same intent as
+    /// <see cref="Clear"/> minus the file-handle teardown.
+    /// </summary>
+    public void ClearResidentChunks()
+    {
         _chunks.Clear();
         _keysList.Clear();
-        CloseLazyReaders();
         _hits = 0;
         _missesNotBuilt = 0;
         _missesDirtyRebuild = 0;
@@ -82,6 +93,51 @@ public sealed class StepCache
     // fetched on demand from the file when ResolveMissingChunk fires; resident memory
     // stays bounded by MaxResidentChunks regardless of file size.
     private readonly Dictionary<int, StepCacheFile.LazyReader> _lazyReaders = new();
+
+    /// <summary>
+    /// Combined XxHash3 fingerprint of the running server's TileData flag tables AND
+    /// the per-map .mul / .uop file contents (mapX.mul, staidxX.mul, staticsX.mul).
+    /// Public surface for tooling (benchmark fixtures, bake utilities) that wants to
+    /// detect a stale .swb file without round-tripping through the lazy-open path.
+    /// </summary>
+    public static ulong ComputeLiveFingerprint(int mapId) => StepCacheFile.ComputeFingerprint(mapId);
+
+    /// <summary>
+    /// Peek at a .swb file's stored fingerprint field without parsing the rest of the
+    /// header. Returns false on missing file, bad magic, or wrong version.
+    /// </summary>
+    public static bool TryReadFingerprintFromFile(string path, out ulong fingerprint) =>
+        StepCacheFile.TryReadFingerprint(path, out fingerprint);
+
+    /// <summary>
+    /// Walk every chunk in <paramref name="mapId"/>, populate the resident set, then
+    /// save to <paramref name="path"/>. Returns the number of chunks written.
+    /// Designed for offline / fixture use; blocks the calling thread for many seconds
+    /// on a full Trammel walk.
+    /// </summary>
+    public int BakeMap(int mapId, string path)
+    {
+        var map = Map.Maps[mapId];
+        if (map == null || map == Map.Internal)
+        {
+            return 0;
+        }
+
+        var chunkCols = (map.Width + ChunkSize - 1) / ChunkSize;
+        var chunkRows = (map.Height + ChunkSize - 1) / ChunkSize;
+
+        for (var cy = 0; cy < chunkRows; cy++)
+        {
+            for (var cx = 0; cx < chunkCols; cx++)
+            {
+                // Any sourceZ works — the chunk is built on first access regardless of
+                // whether the query returns Hit or Fallthrough_SourceZMismatch.
+                TryGetMask(map, cx * ChunkSize, cy * ChunkSize, sourceZ: 0);
+            }
+        }
+
+        return SaveToFile(path, mapId);
+    }
 
     /// <summary>
     /// Persist all resident chunks for <paramref name="mapId"/> to a .swb file. Returns
