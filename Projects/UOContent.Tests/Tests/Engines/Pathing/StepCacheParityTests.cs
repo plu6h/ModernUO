@@ -29,6 +29,7 @@ public class StepCacheParityTests
         var disagreements = 0;
         var samples = 0;
         var multiZ = 0;
+        var wetCells = 0;
 
         for (var x = xStart; x < xStart + size; x++)
         {
@@ -43,41 +44,49 @@ public class StepCacheParityTests
 
                 var baker = StepProbe.ComputeMaskAt(map, x, y, sourceZ);
 
-                var ok = cache.TryGetMask(
-                    map, x, y, sourceZ,
-                    out var mask,
-                    out var dN, out var dNE, out var dE, out var dSE,
-                    out var dS, out var dSW, out var dW, out var dNW,
-                    out var hitKind
-                );
+                var lookup = cache.TryGetMask(map, x, y, sourceZ);
 
                 samples++;
 
-                if (hitKind == CacheHitKind.Fallthrough_MultiZ)
+                if (lookup.HitKind == CacheHitKind.Fallthrough_MultiZ)
                 {
                     multiZ++;
                     continue;
                 }
 
-                Assert.True(ok, $"Cache returned !ok at ({x},{y}) hitKind={hitKind}");
+                Assert.True(lookup.IsHit, $"Cache returned !ok at ({x},{y}) hitKind={lookup.HitKind}");
 
-                if (mask != baker.Mask)
+                if (lookup.WalkMask != baker.WalkMask)
                 {
                     disagreements++;
-                    _output.WriteLine($"MASK DIFF @ ({x},{y}) cache=0x{mask:X2} baker=0x{baker.Mask:X2}");
+                    _output.WriteLine($"WALK MASK DIFF @ ({x},{y}) cache=0x{lookup.WalkMask:X2} baker=0x{baker.WalkMask:X2}");
                     continue;
                 }
 
-                if (dN != baker.DestZ_N || dNE != baker.DestZ_NE || dE != baker.DestZ_E || dSE != baker.DestZ_SE
-                    || dS != baker.DestZ_S || dSW != baker.DestZ_SW || dW != baker.DestZ_W || dNW != baker.DestZ_NW)
+                if (lookup.WetMask != baker.WetMask)
                 {
                     disagreements++;
-                    _output.WriteLine($"Z DIFF @ ({x},{y}) cache=({dN},{dNE},{dE},{dSE},{dS},{dSW},{dW},{dNW}) baker=({baker.DestZ_N},{baker.DestZ_NE},{baker.DestZ_E},{baker.DestZ_SE},{baker.DestZ_S},{baker.DestZ_SW},{baker.DestZ_W},{baker.DestZ_NW})");
+                    _output.WriteLine($"WET MASK DIFF @ ({x},{y}) cache=0x{lookup.WetMask:X2} baker=0x{baker.WetMask:X2}");
+                    continue;
+                }
+
+                if (lookup.WetMask != 0)
+                {
+                    wetCells++;
+                }
+
+                if (lookup.WalkZ_N != baker.WalkZ_N || lookup.WalkZ_NE != baker.WalkZ_NE
+                    || lookup.WalkZ_E != baker.WalkZ_E || lookup.WalkZ_SE != baker.WalkZ_SE
+                    || lookup.WalkZ_S != baker.WalkZ_S || lookup.WalkZ_SW != baker.WalkZ_SW
+                    || lookup.WalkZ_W != baker.WalkZ_W || lookup.WalkZ_NW != baker.WalkZ_NW)
+                {
+                    disagreements++;
+                    _output.WriteLine($"Z DIFF @ ({x},{y}) cache=({lookup.WalkZ_N},{lookup.WalkZ_NE},{lookup.WalkZ_E},{lookup.WalkZ_SE},{lookup.WalkZ_S},{lookup.WalkZ_SW},{lookup.WalkZ_W},{lookup.WalkZ_NW}) baker=({baker.WalkZ_N},{baker.WalkZ_NE},{baker.WalkZ_E},{baker.WalkZ_SE},{baker.WalkZ_S},{baker.WalkZ_SW},{baker.WalkZ_W},{baker.WalkZ_NW})");
                 }
             }
         }
 
-        _output.WriteLine($"[{label}] samples={samples} disagreements={disagreements} multiZ={multiZ}");
+        _output.WriteLine($"[{label}] samples={samples} disagreements={disagreements} multiZ={multiZ} wetCells={wetCells}");
 
         // Non-vacuity: at least the inn region must have at least one cell that produced a real cache answer.
         if (label == "britain_inn_dense")
@@ -86,5 +95,41 @@ public class StepCacheParityTests
         }
 
         Assert.Equal(0, disagreements);
+    }
+
+    /// <summary>
+    /// Non-vacuity guard for the swim bake: scans a wide swath of the south-Britain bay
+    /// (Atlantic coast) and asserts at least one cell has a non-zero WetMask. Catches the
+    /// failure mode where StepProbe silently bakes zero swim output everywhere.
+    /// </summary>
+    [Fact]
+    public void SwimBake_ProducesWetCells_OnKnownWaterRegion()
+    {
+        var map = Map.Maps[1];
+        Assert.NotNull(map);
+
+        // South Britain → Britain bay, includes Atlantic shoreline. 64×64 = 4096 cells;
+        // even a partial coastline straddle should yield dozens of wet cells.
+        const int xStart = 1430;
+        const int yStart = 1740;
+        const int size = 64;
+
+        var wetCells = 0;
+        for (var x = xStart; x < xStart + size; x++)
+        {
+            for (var y = yStart; y < yStart + size; y++)
+            {
+                map.GetAverageZ(x, y, out _, out var avgZ, out _);
+                var sourceZ = (sbyte)StepProbe.ComputeStandingZ(map, x, y, avgZ);
+                var baker = StepProbe.ComputeMaskAt(map, x, y, sourceZ);
+                if (baker.WetMask != 0)
+                {
+                    wetCells++;
+                }
+            }
+        }
+
+        _output.WriteLine($"south-britain swim probe: wetCells={wetCells} of 4096");
+        Assert.True(wetCells > 0, "swim bake produced zero wet cells across a 64×64 coastal region");
     }
 }

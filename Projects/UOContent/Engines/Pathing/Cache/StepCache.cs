@@ -143,25 +143,16 @@ public sealed class StepCache
     private const int ChunkSize = 16;
 
     /// <summary>
-    /// Hot-path query. Returns the cached mask + 8 destination Z values for (map, x, y, sourceZ).
-    /// Returns false on off-map or multi-Z fallthrough; the caller should use the slow path.
+    /// Hot-path query. Returns the cached mask + 8 destination Z values + hit kind.
+    /// Inspect <see cref="StepMask.IsHit"/> to decide whether to use the result or fall
+    /// back to the slow path.
     /// </summary>
-    public bool TryGetMask(
-        Map map, int x, int y, sbyte sourceZ,
-        out byte mask,
-        out sbyte destZN, out sbyte destZNE, out sbyte destZE, out sbyte destZSE,
-        out sbyte destZS, out sbyte destZSW, out sbyte destZW, out sbyte destZNW,
-        out CacheHitKind hitKind
-    )
+    public StepMask TryGetMask(Map map, int x, int y, sbyte sourceZ)
     {
-        mask = 0;
-        destZN = destZNE = destZE = destZSE = destZS = destZSW = destZW = destZNW = 0;
-
         if (map == null || map == Map.Internal || x < 0 || y < 0 || x >= map.Width || y >= map.Height)
         {
-            hitKind = CacheHitKind.Fallthrough_OffMap;
             _fallthroughOffMap++;
-            return false;
+            return new StepMask(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CacheHitKind.Fallthrough_OffMap);
         }
 
         var chunkX = x >> 4;
@@ -184,9 +175,8 @@ public sealed class StepCache
                 chunk = BuildChunk(map, chunkX, chunkY);
                 _chunks[key] = chunk;
                 hitKindResult = CacheHitKind.Miss_DirtyRebuild;
-                // _missesDirtyRebuild++ moved into the success switch below to
-                // preserve the mutual-exclusivity invariant (a multi-Z fallthrough
-                // on a freshly dirty-rebuilt chunk must NOT count both counters).
+                // _missesDirtyRebuild++ deferred to the outcome switch below so a
+                // multi-Z fallthrough on a freshly dirty-rebuilt chunk doesn't double-count.
             }
         }
 
@@ -196,9 +186,8 @@ public sealed class StepCache
 
         if (chunk.IsCellMultiZ(cellIndex))
         {
-            hitKind = CacheHitKind.Fallthrough_MultiZ;
             _fallthroughMultiZ++;
-            return false;
+            return new StepMask(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CacheHitKind.Fallthrough_MultiZ);
         }
 
         // Source-Z guard: the cache stores one answer per cell baked at SourceZ.
@@ -206,42 +195,38 @@ public sealed class StepCache
         // because tile reachability shifts at step-height boundaries.
         if (Math.Abs(sourceZ - chunk.SourceZ[cellIndex]) > StepHeight)
         {
-            hitKind = CacheHitKind.Fallthrough_SourceZMismatch;
             _fallthroughSourceZMismatch++;
-            return false;
+            return new StepMask(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CacheHitKind.Fallthrough_SourceZMismatch);
         }
-
-        mask = chunk.Mask[cellIndex];
-        destZN  = chunk.DestZN[cellIndex];
-        destZNE = chunk.DestZNE[cellIndex];
-        destZE  = chunk.DestZE[cellIndex];
-        destZSE = chunk.DestZSE[cellIndex];
-        destZS  = chunk.DestZS[cellIndex];
-        destZSW = chunk.DestZSW[cellIndex];
-        destZW  = chunk.DestZW[cellIndex];
-        destZNW = chunk.DestZNW[cellIndex];
 
         switch (hitKindResult)
         {
-            case CacheHitKind.Miss_NotBuilt:
-                {
-                    _missesNotBuilt++;
-                    break;
-                }
-            case CacheHitKind.Miss_DirtyRebuild:
-                {
-                    _missesDirtyRebuild++;
-                    break;
-                }
-            case CacheHitKind.Hit:
-                {
-                    _hits++;
-                    break;
-                }
+            case CacheHitKind.Miss_NotBuilt:    { _missesNotBuilt++;     break; }
+            case CacheHitKind.Miss_DirtyRebuild: { _missesDirtyRebuild++; break; }
+            case CacheHitKind.Hit:              { _hits++;               break; }
         }
-        hitKind = hitKindResult;
 
-        return true;
+        return new StepMask(
+            chunk.WalkMask[cellIndex],
+            chunk.WetMask[cellIndex],
+            chunk.WalkZN[cellIndex],
+            chunk.WalkZNE[cellIndex],
+            chunk.WalkZE[cellIndex],
+            chunk.WalkZSE[cellIndex],
+            chunk.WalkZS[cellIndex],
+            chunk.WalkZSW[cellIndex],
+            chunk.WalkZW[cellIndex],
+            chunk.WalkZNW[cellIndex],
+            chunk.SwimZN[cellIndex],
+            chunk.SwimZNE[cellIndex],
+            chunk.SwimZE[cellIndex],
+            chunk.SwimZSE[cellIndex],
+            chunk.SwimZS[cellIndex],
+            chunk.SwimZSW[cellIndex],
+            chunk.SwimZW[cellIndex],
+            chunk.SwimZNW[cellIndex],
+            hitKindResult
+        );
     }
 
     /// <summary>
@@ -276,16 +261,25 @@ public sealed class StepCache
 
                 var result = StepProbe.ComputeMaskAt(map, x, y, standingZ);
 
-                chunk.Mask[cell] = result.Mask;
-                chunk.SourceZ[cell] = standingZ;
-                chunk.DestZN[cell]  = result.DestZ_N;
-                chunk.DestZNE[cell] = result.DestZ_NE;
-                chunk.DestZE[cell]  = result.DestZ_E;
-                chunk.DestZSE[cell] = result.DestZ_SE;
-                chunk.DestZS[cell]  = result.DestZ_S;
-                chunk.DestZSW[cell] = result.DestZ_SW;
-                chunk.DestZW[cell]  = result.DestZ_W;
-                chunk.DestZNW[cell] = result.DestZ_NW;
+                chunk.WalkMask[cell] = result.WalkMask;
+                chunk.WetMask[cell]  = result.WetMask;
+                chunk.SourceZ[cell]  = standingZ;
+                chunk.WalkZN[cell]   = result.WalkZ_N;
+                chunk.WalkZNE[cell]  = result.WalkZ_NE;
+                chunk.WalkZE[cell]   = result.WalkZ_E;
+                chunk.WalkZSE[cell]  = result.WalkZ_SE;
+                chunk.WalkZS[cell]   = result.WalkZ_S;
+                chunk.WalkZSW[cell]  = result.WalkZ_SW;
+                chunk.WalkZW[cell]   = result.WalkZ_W;
+                chunk.WalkZNW[cell]  = result.WalkZ_NW;
+                chunk.SwimZN[cell]   = result.SwimZ_N;
+                chunk.SwimZNE[cell]  = result.SwimZ_NE;
+                chunk.SwimZE[cell]   = result.SwimZ_E;
+                chunk.SwimZSE[cell]  = result.SwimZ_SE;
+                chunk.SwimZS[cell]   = result.SwimZ_S;
+                chunk.SwimZSW[cell]  = result.SwimZ_SW;
+                chunk.SwimZW[cell]   = result.SwimZ_W;
+                chunk.SwimZNW[cell]  = result.SwimZ_NW;
 
                 // Multi-Z = ≥2 surfaces reachable from standingZ. Mirrors the baker's
                 // CheckStaticStep filter so we don't over-mark.

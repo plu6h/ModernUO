@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using Server.Engines.Pathing.Cache;
 using Server.Mobiles;
+using Server.Systems.FeatureFlags;
 using CalcMoves = Server.Movement.Movement;
 using MoveImpl = Server.Movement.MovementImpl;
 
@@ -61,8 +62,26 @@ public class BitmapAStarAlgorithm : PathAlgorithm
     private static int _yOffset;
 
     // When set, GetSuccessors delegates to the per-cell slow path on every expansion
-    // (preserves player AND-rule and BaseCreature capability overlays). Reset at end of Find.
+    // (creature has CanFly — Z-jumping is beyond the cache's static-only scope).
     private static bool _currentMobileNeedsSlowPath;
+
+    // When set, diagonal corner-cut uses the strict AND-rule (BOTH cardinal partners
+    // must be walkable) instead of the lenient creature OR-rule. Cache still applies —
+    // partner bits live in the same source-cell mask byte. Non-GM players only.
+    private static bool _currentMobilePlayerStrict;
+
+    // Capability overlay applied to cache results. Layered each cell:
+    //   effective = (walkMask & !cantWalk) | (wetMask & canSwim)
+    // Reset at end of Find.
+    private static bool _currentMobileCanSwim;
+    private static bool _currentMobileCantWalk;
+
+    // Dynamic-obstacle pass capability flags (per-mobile, captured in Find).
+    // Mirrors MovementImpl.Check's per-mobile derivations so per-cell items/mobiles
+    // checks can be evaluated without re-deriving.
+    private static bool _currentMobileIgnoreDoors;
+    private static bool _currentMobileIgnoreSpellFields;
+    private static bool _currentMobileIgnoreMovableImpassables;
 
     private Point3D _goal;
 
@@ -89,7 +108,25 @@ public class BitmapAStarAlgorithm : PathAlgorithm
             return null;
         }
 
-        _currentMobileNeedsSlowPath = !IsDefaultWalker(m);
+        _currentMobileNeedsSlowPath = RequiresSlowPath(m);
+        _currentMobilePlayerStrict = m.Player && m.AccessLevel < AccessLevel.GameMaster;
+        if (m is BaseCreature creature)
+        {
+            _currentMobileCanSwim = creature.CanSwim;
+            _currentMobileCantWalk = creature.CantWalk;
+            _currentMobileIgnoreDoors = creature.CanOpenDoors;
+            _currentMobileIgnoreMovableImpassables = creature.CanMoveOverObstacles;
+        }
+        else
+        {
+            _currentMobileCanSwim = false;
+            _currentMobileCantWalk = false;
+            _currentMobileIgnoreDoors = false;
+            _currentMobileIgnoreMovableImpassables = false;
+        }
+        // Mirrors MovementImpl: dead/spectral mobiles also ignore doors.
+        _currentMobileIgnoreDoors |= !m.Alive || m.Body.BodyID == 0x3DB || m.IsDeadBondedPet;
+        _currentMobileIgnoreSpellFields = m is PlayerMobile && map != Map.Felucca;
 
         Array.Clear(_nodeStates);
 
@@ -220,12 +257,24 @@ public class BitmapAStarAlgorithm : PathAlgorithm
 
                 _openQueue.Clear();
                 _currentMobileNeedsSlowPath = false;
+                _currentMobilePlayerStrict = false;
+                _currentMobileCanSwim = false;
+                _currentMobileCantWalk = false;
+                _currentMobileIgnoreDoors = false;
+                _currentMobileIgnoreSpellFields = false;
+                _currentMobileIgnoreMovableImpassables = false;
                 return dirs;
             }
         }
 
         _openQueue.Clear();
         _currentMobileNeedsSlowPath = false;
+        _currentMobilePlayerStrict = false;
+        _currentMobileCanSwim = false;
+        _currentMobileCantWalk = false;
+        _currentMobileIgnoreDoors = false;
+        _currentMobileIgnoreSpellFields = false;
+        _currentMobileIgnoreMovableImpassables = false;
         return null;
     }
 
@@ -256,27 +305,25 @@ public class BitmapAStarAlgorithm : PathAlgorithm
 
         var vals = _successors;
 
-        if (_currentMobileNeedsSlowPath)
+        if (_currentMobileNeedsSlowPath || !ContentFeatureFlags.BitmapPathfindingCache)
         {
             return GetSuccessorsSlowPath(m, map, px, py, p3D, vals);
         }
 
         var count = 0;
 
-        StepCache.Instance.TryGetMask(
-            map, p3D.X, p3D.Y, (sbyte)p3D.Z,
-            out var mask,
-            out var dN, out var dNE, out var dE, out var dSE,
-            out var dS, out var dSW, out var dW, out var dNW,
-            out var hitKind
-        );
+        var lookup = StepCache.Instance.TryGetMask(map, p3D.X, p3D.Y, (sbyte)p3D.Z);
 
-        if (hitKind is CacheHitKind.Fallthrough_MultiZ
-            or CacheHitKind.Fallthrough_OffMap
-            or CacheHitKind.Fallthrough_SourceZMismatch)
+        if (!lookup.IsHit)
         {
             return GetSuccessorsSlowPath(m, map, px, py, p3D, vals);
         }
+
+        // Capability overlay: walking allowed unless cantWalk; swimming allowed if canSwim.
+        // Partner bits used for diagonal corner-cut also use the effective mask.
+        var walkBits = _currentMobileCantWalk ? (byte)0 : lookup.WalkMask;
+        var swimBits = _currentMobileCanSwim ? lookup.WetMask : (byte)0;
+        var mask = (byte)(walkBits | swimBits);
 
         for (var i = 0; i < 8; ++i)
         {
@@ -294,31 +341,62 @@ public class BitmapAStarAlgorithm : PathAlgorithm
                 continue;
             }
 
-            // Diagonal corner-cut (creature OR-rule): partner bits live in the same mask byte.
+            // Diagonal corner-cut. Creatures (default): OR-rule — at least one cardinal
+            // partner walkable. Non-GM players: AND-rule — BOTH partners must be walkable.
+            // Partner bits live in the same source-cell mask byte either way.
             if ((i & 1) == 1)
             {
                 var leftBit = 1 << ((i - 1) & 0x7);
                 var rightBit = 1 << ((i + 1) & 0x7);
-                if ((mask & leftBit) == 0 && (mask & rightBit) == 0)
+                if (_currentMobilePlayerStrict
+                        ? (mask & leftBit) == 0 || (mask & rightBit) == 0
+                        : (mask & leftBit) == 0 && (mask & rightBit) == 0)
                 {
                     continue;
                 }
             }
 
-            var z = i switch
-            {
-                0 => dN,
-                1 => dNE,
-                2 => dE,
-                3 => dSE,
-                4 => dS,
-                5 => dSW,
-                6 => dW,
-                7 => dNW,
-                _ => (sbyte)0
-            };
+            // Walking takes precedence over swimming when both apply (matches MovementImpl's
+            // surface-selection: closest-to-startZ wins, and walk surface is always closer
+            // when the creature is currently standing on land).
+            var useWalkZ = (walkBits & (1 << i)) != 0;
+            var z = useWalkZ
+                ? i switch
+                {
+                    0 => lookup.WalkZ_N,
+                    1 => lookup.WalkZ_NE,
+                    2 => lookup.WalkZ_E,
+                    3 => lookup.WalkZ_SE,
+                    4 => lookup.WalkZ_S,
+                    5 => lookup.WalkZ_SW,
+                    6 => lookup.WalkZ_W,
+                    7 => lookup.WalkZ_NW,
+                    _ => (sbyte)0
+                }
+                : i switch
+                {
+                    0 => lookup.SwimZ_N,
+                    1 => lookup.SwimZ_NE,
+                    2 => lookup.SwimZ_E,
+                    3 => lookup.SwimZ_SE,
+                    4 => lookup.SwimZ_S,
+                    5 => lookup.SwimZ_SW,
+                    6 => lookup.SwimZ_W,
+                    7 => lookup.SwimZ_NW,
+                    _ => (sbyte)0
+                };
 
-            var idx = GetIndex(x + _xOffset, y + _yOffset, z);
+            var absX = x + _xOffset;
+            var absY = y + _yOffset;
+
+            // Dynamic-obstacle pass: items + mobiles at the target cell. Cache only
+            // covers static walkability; dynamic state has to be checked at query time.
+            if (IsBlockedByDynamic(m, map, absX, absY, z))
+            {
+                continue;
+            }
+
+            var idx = GetIndex(absX, absY, z);
 
             if (idx >= 0 && idx < NodeCount)
             {
@@ -329,6 +407,79 @@ public class BitmapAStarAlgorithm : PathAlgorithm
 
         return count;
     }
+
+    private const int PersonHeightConst = 16;
+    private const int MobileHeight = 15;
+
+    /// <summary>
+    /// Mirrors MovementImpl's dynamic-item / mobile collision phase for a target cell.
+    /// Items: ImpassableSurface that overlap (z, z+PersonHeight), respecting capability
+    /// overrides (CanOpenDoors → ignore door items; CanMoveOverObstacles → ignore movables;
+    /// non-Felucca players → ignore spell fields). Mobiles: any other mobile whose Z range
+    /// overlaps and which we can't move over.
+    /// </summary>
+    private static bool IsBlockedByDynamic(Mobile m, Map map, int x, int y, int z)
+    {
+        var ourTop = z + PersonHeightConst;
+
+        foreach (var item in map.GetItemsAt(x, y))
+        {
+            var itemData = item.ItemData;
+            if (!itemData.ImpassableSurface)
+            {
+                continue;
+            }
+
+            if (_currentMobileIgnoreMovableImpassables && item.Movable)
+            {
+                continue;
+            }
+
+            var itemId = item.ItemID & TileData.MaxItemValue;
+            if (_currentMobileIgnoreDoors
+                && (itemData.Door
+                    || itemId is 0x692 or 0x846 or 0x873
+                    || itemId >= 0x6F5 && itemId <= 0x6F6))
+            {
+                continue;
+            }
+
+            if (_currentMobileIgnoreSpellFields && itemId is 0x82 or 0x3946 or 0x3956)
+            {
+                continue;
+            }
+
+            var checkZ = item.Z;
+            var checkTop = checkZ + itemData.CalcHeight;
+            if (checkTop > z && ourTop > checkZ)
+            {
+                return true;
+            }
+        }
+
+        foreach (var mob in map.GetMobilesAt(x, y))
+        {
+            if (mob == m)
+            {
+                continue;
+            }
+
+            if (mob.Z + MobileHeight > z && z + MobileHeight > mob.Z && !CanMoveOver(m, mob))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Mirrors MovementImpl.CanMoveOver — true when m can step onto t's cell (dead bodies,
+    /// hidden staff, etc.).
+    /// </summary>
+    private static bool CanMoveOver(Mobile m, Mobile t) =>
+        !t.Alive || !m.Alive || t.IsDeadBondedPet || m.IsDeadBondedPet
+        || t.Hidden && t.AccessLevel > AccessLevel.Player;
 
     /// <summary>
     /// Per-direction <see cref="CalcMoves.CheckMovement"/> loop for a single source cell.
@@ -365,22 +516,12 @@ public class BitmapAStarAlgorithm : PathAlgorithm
     }
 
     /// <summary>
-    /// Default walker = the cache's baked rules apply directly (lenient OR-rule for
-    /// diagonal corner-cut, no capability overlays). Non-GM players (strict AND-rule)
-    /// and creatures with swim/fly/door/clip capabilities require the slow path.
+    /// True for creatures whose movement rules the static cache can't model. Currently
+    /// only CanFly — flying creatures Z-jump arbitrarily and the cache's source-Z guard
+    /// would over-fire. CanSwim / CantWalk are handled via the capability overlay (walkMask
+    /// + wetMask). CanOpenDoors / CanMoveOverObstacles only affect dynamic items and don't
+    /// disqualify the cache.
     /// </summary>
-    private static bool IsDefaultWalker(Mobile m)
-    {
-        if (m.Player && m.AccessLevel < AccessLevel.GameMaster)
-        {
-            return false;
-        }
-
-        if (m is not BaseCreature bc)
-        {
-            return true;
-        }
-
-        return !bc.CanSwim && !bc.CanFly && !bc.CanOpenDoors && !bc.CanMoveOverObstacles;
-    }
+    private static bool RequiresSlowPath(Mobile m) =>
+        m is BaseCreature bc && bc.CanFly;
 }
