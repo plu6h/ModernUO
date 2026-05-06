@@ -2,7 +2,7 @@
  * ModernUO                                                              *
  * Copyright 2019-2026 - ModernUO Development Team                       *
  * Email: hi@modernuo.com                                                *
- * File: FastAStarAlgorithm.cs                                           *
+ * File: BitmapAStarAlgorithm.cs                                         *
  *                                                                       *
  * This program is free software: you can redistribute it and/or modify  *
  * it under the terms of the GNU General Public License as published by  *
@@ -14,15 +14,24 @@
  ************************************************************************/
 
 using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using Server.Engines.Pathing.Cache;
 using Server.Mobiles;
 using CalcMoves = Server.Movement.Movement;
 using MoveImpl = Server.Movement.MovementImpl;
-using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 
-namespace Server.PathAlgorithms.FastAStar;
+namespace Server.PathAlgorithms.BitmapAStar;
 
-public class FastAStarAlgorithm : PathAlgorithm
+/// <summary>
+/// A* pathfinder with a single bitmap-cache lookup per cell expansion. Default walkers
+/// take one <see cref="StepCache.TryGetMask"/> call returning the 8-direction
+/// mask + per-direction Z. Non-default walkers (non-GM players, creatures with swim/fly/
+/// door/clip capabilities) and per-cell cache fallthroughs route through
+/// <see cref="GetSuccessorsSlowPath"/>, which runs the per-direction
+/// <see cref="CalcMoves.CheckMovement"/> loop for that one cell.
+/// </summary>
+public class BitmapAStarAlgorithm : PathAlgorithm
 {
     private struct PathNode
     {
@@ -40,7 +49,7 @@ public class FastAStarAlgorithm : PathAlgorithm
     private const int PlaneOffset = 128;
     private const int PlaneCount = 13;
     private const int PlaneHeight = 20;
-    public static readonly PathAlgorithm Instance = new FastAStarAlgorithm();
+    public static readonly PathAlgorithm Instance = new BitmapAStarAlgorithm();
 
     private static readonly Direction[] _path = new Direction[AreaSize * AreaSize];
     private static readonly PathNode[] _nodes = new PathNode[NodeCount];
@@ -50,6 +59,10 @@ public class FastAStarAlgorithm : PathAlgorithm
 
     private static int _xOffset;
     private static int _yOffset;
+
+    // When set, GetSuccessors delegates to the per-cell slow path on every expansion
+    // (preserves player AND-rule and BaseCreature capability overlays). Reset at end of Find.
+    private static bool _currentMobileNeedsSlowPath;
 
     private Point3D _goal;
 
@@ -75,6 +88,8 @@ public class FastAStarAlgorithm : PathAlgorithm
         {
             return null;
         }
+
+        _currentMobileNeedsSlowPath = !IsDefaultWalker(m);
 
         Array.Clear(_nodeStates);
 
@@ -120,6 +135,7 @@ public class FastAStarAlgorithm : PathAlgorithm
 
             _nodeStates[bestNode] = 2;
 
+            // Set MovementImpl globals so per-cell slow-path fallthroughs see the right state.
             if (bc != null)
             {
                 MoveImpl.AlwaysIgnoreDoors = bc.CanOpenDoors;
@@ -203,11 +219,13 @@ public class FastAStarAlgorithm : PathAlgorithm
                 }
 
                 _openQueue.Clear();
+                _currentMobileNeedsSlowPath = false;
                 return dirs;
             }
         }
 
         _openQueue.Clear();
+        _currentMobileNeedsSlowPath = false;
         return null;
     }
 
@@ -221,6 +239,13 @@ public class FastAStarAlgorithm : PathAlgorithm
         return x + y * AreaSize + z * AreaSize * AreaSize;
     }
 
+    /// <summary>
+    /// One <see cref="StepCache.TryGetMask"/> call returns the 8-direction
+    /// walkable mask + destination Zs. Diagonal corner-cut applies the lenient creature
+    /// OR-rule using partner bits in the same mask byte — no neighbor-chunk lookup needed.
+    /// On cache fallthrough or for non-default walkers, defers to
+    /// <see cref="GetSuccessorsSlowPath"/> for THIS cell only.
+    /// </summary>
     private static int GetSuccessors(int p, Mobile m, Map map)
     {
         var px = p % AreaSize;
@@ -230,50 +255,94 @@ public class FastAStarAlgorithm : PathAlgorithm
         var p3D = new Point3D(px + _xOffset, py + _yOffset, pz);
 
         var vals = _successors;
+
+        if (_currentMobileNeedsSlowPath)
+        {
+            return GetSuccessorsSlowPath(m, map, px, py, p3D, vals);
+        }
+
+        var count = 0;
+
+        StepCache.Instance.TryGetMask(
+            map, p3D.X, p3D.Y, (sbyte)p3D.Z,
+            out var mask,
+            out var dN, out var dNE, out var dE, out var dSE,
+            out var dS, out var dSW, out var dW, out var dNW,
+            out var hitKind
+        );
+
+        if (hitKind is CacheHitKind.Fallthrough_MultiZ
+            or CacheHitKind.Fallthrough_OffMap
+            or CacheHitKind.Fallthrough_SourceZMismatch)
+        {
+            return GetSuccessorsSlowPath(m, map, px, py, p3D, vals);
+        }
+
+        for (var i = 0; i < 8; ++i)
+        {
+            var x = px;
+            var y = py;
+            CalcMoves.Offset((Direction)i, ref x, ref y);
+
+            if (x is < 0 or >= AreaSize || y is < 0 or >= AreaSize)
+            {
+                continue;
+            }
+
+            if ((mask & (1 << i)) == 0)
+            {
+                continue;
+            }
+
+            // Diagonal corner-cut (creature OR-rule): partner bits live in the same mask byte.
+            if ((i & 1) == 1)
+            {
+                var leftBit = 1 << ((i - 1) & 0x7);
+                var rightBit = 1 << ((i + 1) & 0x7);
+                if ((mask & leftBit) == 0 && (mask & rightBit) == 0)
+                {
+                    continue;
+                }
+            }
+
+            var z = i switch
+            {
+                0 => dN,
+                1 => dNE,
+                2 => dE,
+                3 => dSE,
+                4 => dS,
+                5 => dSW,
+                6 => dW,
+                7 => dNW,
+                _ => (sbyte)0
+            };
+
+            var idx = GetIndex(x + _xOffset, y + _yOffset, z);
+
+            if (idx >= 0 && idx < NodeCount)
+            {
+                _nodes[idx].z = z;
+                vals[count++] = idx;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Per-direction <see cref="CalcMoves.CheckMovement"/> loop for a single source cell.
+    /// Runs on cache fallthrough or when <see cref="_currentMobileNeedsSlowPath"/> is set.
+    /// </summary>
+    private static int GetSuccessorsSlowPath(Mobile m, Map map, int px, int py, Point3D p3D, int[] vals)
+    {
         var count = 0;
 
         for (var i = 0; i < 8; ++i)
         {
-            int x;
-            int y;
-            switch (i)
-            {
-                default: // 0
-                    x = 0;
-                    y = -1;
-                    break;
-                case 1:
-                    x = 1;
-                    y = -1;
-                    break;
-                case 2:
-                    x = 1;
-                    y = 0;
-                    break;
-                case 3:
-                    x = 1;
-                    y = 1;
-                    break;
-                case 4:
-                    x = 0;
-                    y = 1;
-                    break;
-                case 5:
-                    x = -1;
-                    y = 1;
-                    break;
-                case 6:
-                    x = -1;
-                    y = 0;
-                    break;
-                case 7:
-                    x = -1;
-                    y = -1;
-                    break;
-            }
-
-            x += px;
-            y += py;
+            var x = px;
+            var y = py;
+            CalcMoves.Offset((Direction)i, ref x, ref y);
 
             if (x is < 0 or >= AreaSize || y is < 0 or >= AreaSize)
             {
@@ -293,5 +362,25 @@ public class FastAStarAlgorithm : PathAlgorithm
         }
 
         return count;
+    }
+
+    /// <summary>
+    /// Default walker = the cache's baked rules apply directly (lenient OR-rule for
+    /// diagonal corner-cut, no capability overlays). Non-GM players (strict AND-rule)
+    /// and creatures with swim/fly/door/clip capabilities require the slow path.
+    /// </summary>
+    private static bool IsDefaultWalker(Mobile m)
+    {
+        if (m.Player && m.AccessLevel < AccessLevel.GameMaster)
+        {
+            return false;
+        }
+
+        if (m is not BaseCreature bc)
+        {
+            return true;
+        }
+
+        return !bc.CanSwim && !bc.CanFly && !bc.CanOpenDoors && !bc.CanMoveOverObstacles;
     }
 }
